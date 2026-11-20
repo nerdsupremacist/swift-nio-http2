@@ -195,7 +195,7 @@ final class HTTP2StreamChannel: Channel, ChannelCore, @unchecked Sendable {
         // 2. Calling the initializer, if provided.
         // 3. Activating when complete.
         // 4. Catching errors if they occur.
-        self.getAutoReadFromParent { autoReadResult in
+        @Sendable func configure(autoRead autoReadResult: Result<Bool, Error>) {
             switch autoReadResult {
             case .success(let autoRead):
                 self.autoRead = autoRead
@@ -212,6 +212,11 @@ final class HTTP2StreamChannel: Channel, ChannelCore, @unchecked Sendable {
                 self.configurationFailed(withError: error, promise: promise)
             }
         }
+        if let autoRead = self.autoReadFromParentSynchronously() {
+            configure(autoRead: autoRead)
+        } else {
+            self.parent!.getOption(ChannelOptions.autoRead).whenComplete { configure(autoRead: $0) }
+        }
     }
 
     internal func configure(initializer: NIOChannelInitializer?, userPromise promise: EventLoopPromise<Channel>?) {
@@ -221,7 +226,7 @@ final class HTTP2StreamChannel: Channel, ChannelCore, @unchecked Sendable {
         // 2. Calling the initializer, if provided.
         // 3. Activating when complete.
         // 4. Catching errors if they occur.
-        self.getAutoReadFromParent { autoReadResult in
+        @Sendable func configure(autoRead autoReadResult: Result<Bool, Error>) {
             switch autoReadResult {
             case .success(let autoRead):
                 self.autoRead = autoRead
@@ -235,6 +240,11 @@ final class HTTP2StreamChannel: Channel, ChannelCore, @unchecked Sendable {
             case .failure(let error):
                 self.configurationFailed(withError: error, promise: promise)
             }
+        }
+        if let autoRead = self.autoReadFromParentSynchronously() {
+            configure(autoRead: autoRead)
+        } else {
+            self.parent!.getOption(ChannelOptions.autoRead).whenComplete { configure(autoRead: $0) }
         }
     }
 
@@ -251,7 +261,7 @@ final class HTTP2StreamChannel: Channel, ChannelCore, @unchecked Sendable {
         // 2. Calling the initializer, if provided.
         // 3. Activating when complete.
         // 4. Catching errors if they occur.
-        self.getAutoReadFromParent { autoReadResult in
+        @Sendable func configure(autoRead autoReadResult: Result<Bool, Error>) {
             switch autoReadResult {
             case .success(let autoRead):
                 self.autoRead = autoRead
@@ -261,6 +271,11 @@ final class HTTP2StreamChannel: Channel, ChannelCore, @unchecked Sendable {
             case .failure(let error):
                 self.configurationFailed(withError: error, promise: promise)
             }
+        }
+        if let autoRead = self.autoReadFromParentSynchronously() {
+            configure(autoRead: autoRead)
+        } else {
+            self.parent!.getOption(ChannelOptions.autoRead).whenComplete { configure(autoRead: $0) }
         }
     }
 
@@ -276,20 +291,16 @@ final class HTTP2StreamChannel: Channel, ChannelCore, @unchecked Sendable {
         }
     }
 
-    /// Gets the 'autoRead' option from the parent channel and invokes the `body` closure with the
-    /// result. This may be done synchronously if the parent `Channel` supports synchronous options.
-    private func getAutoReadFromParent(_ body: @Sendable @escaping (Result<Bool, Error>) -> Void) {
+    /// Gets the 'autoRead' option from the parent channel, if the parent supports synchronous options.
+    ///
+    /// Callers pass the result to a local function and only form a closure for the asynchronous
+    /// fallback, so the common synchronous path doesn't allocate a closure context per stream.
+    private func autoReadFromParentSynchronously() -> Result<Bool, Error>? {
         // This force unwrap is safe as parent is assigned in the initializer, and never unassigned.
-        // Note we also don't set the value here: the additional `map` causes an extra allocation
-        // when using a Swift 5.0 compiler.
-        if let syncOptions = self.parent!.syncOptions {
-            let autoRead = Result(catching: { try syncOptions.getOption(ChannelOptions.autoRead) })
-            body(autoRead)
-        } else {
-            self.parent!.getOption(ChannelOptions.autoRead).whenComplete { autoRead in
-                body(autoRead)
-            }
+        guard let syncOptions = self.parent!.syncOptions else {
+            return nil
         }
+        return Result(catching: { try syncOptions.getOption(ChannelOptions.autoRead) })
     }
 
     /// Activates the channel if the parent channel is active and succeeds the given `promise`.

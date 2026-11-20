@@ -769,6 +769,8 @@ extension HTTP2StreamChannel {
     /// Deliver all pending reads to the channel.
     private func deliverPendingReads() {
         assert(self._isActive)
+        // WINDOW_UPDATE frames emitted while delivering this batch share one flush at its end.
+        var windowUpdateWritten = false
         while self.pendingReads.count > 0 {
             let frame = self.pendingReads.removeFirst()
 
@@ -792,9 +794,12 @@ extension HTTP2StreamChannel {
                 // To have a pending read, we must have a stream ID.
                 let frame = HTTP2Frame(streamID: self.streamID!, payload: .windowUpdate(windowSizeIncrement: increment))
                 self.receiveOutboundFrame(frame, promise: nil)
-                // This flush should really go away, but we need it for now until we sort out window management.
-                self.multiplexer.flushStream(self.streamID!)
+                windowUpdateWritten = true
             }
+        }
+        if windowUpdateWritten {
+            // This flush should really go away, but we need it for now until we sort out window management.
+            self.multiplexer.flushStream(self.streamID!)
         }
         self.pipeline.fireChannelReadComplete()
     }

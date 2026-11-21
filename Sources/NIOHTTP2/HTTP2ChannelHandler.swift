@@ -153,6 +153,7 @@ public final class NIOHTTP2Handler: ChannelDuplexHandler {
         }
 
         case uninitializedLegacy
+        case uninitializedConsumer(StreamConsumerFactory)
         case uninitializedInline(PendingMultiplexerConfig, StreamInitializer)
         case uninitializedAsync(PendingMultiplexerConfig, StreamInitializerWithAnyOutput)
         case initialized(InboundStreamMultiplexer)
@@ -162,7 +163,8 @@ public final class NIOHTTP2Handler: ChannelDuplexHandler {
             switch self {
             case .initialized(let inboundStreamMultiplexer):
                 return inboundStreamMultiplexer
-            case .uninitializedLegacy, .uninitializedInline, .uninitializedAsync, .deinitialized:
+            case .uninitializedLegacy, .uninitializedConsumer, .uninitializedInline, .uninitializedAsync,
+                .deinitialized:
                 return nil
             }
         }
@@ -179,6 +181,9 @@ public final class NIOHTTP2Handler: ChannelDuplexHandler {
                 )
             case .uninitializedLegacy:
                 self = .initialized(.legacy(LegacyInboundStreamMultiplexer(context: context)))
+
+            case .uninitializedConsumer(let factory):
+                self = .initialized(.consumer(factory(http2Handler, context)))
 
             case .uninitializedInline(let config, let inboundStreamInitializer):
                 self = .initialized(
@@ -491,6 +496,9 @@ public final class NIOHTTP2Handler: ChannelDuplexHandler {
             }
             self.activationState = .activated
             self.writeAndFlushPreamble(context: context)
+            if case .consumer(let core) = self.inboundStreamMultiplexer {
+                core.channelActive()
+            }
         }
     }
 
@@ -860,6 +868,9 @@ extension NIOHTTP2Handler {
             streamID: .rootStream,
             payload: .goAway(lastStreamID: streamID, errorCode: reason, opaqueData: nil)
         )
+        if case .consumer(let core) = self.inboundStreamMultiplexer {
+            core.connectionError = underlyingError
+        }
         self.writeUnbufferedFrame(context: context, frame: goAwayFrame)
         self.flushIfNecessary(context: context)
         context.fireErrorCaught(underlyingError)
@@ -1121,6 +1132,9 @@ extension NIOHTTP2Handler {
         if let delegate = self.frameDelegate {
             delegate.wroteFrame(frame)
         }
+        if case .consumer(let core) = self.inboundStreamMultiplexer {
+            core.outboundEncoded(frame)
+        }
 
         // Ok, if we got here we're good to send data. We want to attach the promise to the latest write, not
         // always the frame header.
@@ -1281,6 +1295,9 @@ extension NIOHTTP2Handler {
         if self.wroteFrame {
             self.wroteFrame = false
             context.flush()
+            if case .consumer(let core) = self.inboundStreamMultiplexer {
+                core.didFlush()
+            }
         }
     }
 
@@ -1383,6 +1400,40 @@ extension NIOHTTP2Handler {
         assert(self.tolerateImpossibleStateTransitionsInDebugMode, "Unexpected channelActive in state \(state)")
         context.fireErrorCaught(NIOHTTP2Errors.ActivationError(state: state, activating: activating))
         context.close(promise: nil)
+    }
+}
+
+extension NIOHTTP2Handler {
+    internal convenience init(mode: ParserMode, configuration: Configuration, frameDelegate: (any NIOHTTP2FrameDelegate)?) {
+        self.init(
+            mode: mode,
+            initialSettings: configuration.connection.initialSettings,
+            headerBlockValidation: configuration.connection.headerBlockValidation,
+            contentLengthValidation: configuration.connection.contentLengthValidation,
+            maximumSequentialEmptyDataFrames: configuration.connection.maximumSequentialEmptyDataFrames,
+            maximumBufferedControlFrames: configuration.connection.maximumBufferedControlFrames,
+            maximumSequentialContinuationFrames: configuration.connection.maximumSequentialContinuationFrames,
+            maximumRecentlyResetStreams: configuration.connection.maximumRecentlyResetStreams,
+            resetFrameRateLimit: .init(configuration.stream.streamResetFrameRateLimit),
+            streamErrorRateLimit: .init(configuration.stream.streamErrorRateLimit),
+            controlFrameRateLimit: .init(configuration.connection.controlFrameRateLimit),
+            maximumConnectionGlitches: configuration.connection.maximumConnectionGlitches,
+            frameDelegate: frameDelegate
+        )
+    }
+
+    internal func setStreamConsumerFactory(_ factory: @escaping StreamConsumerFactory) {
+        self.inboundStreamMultiplexerState = .uninitializedConsumer(factory)
+    }
+
+    /// A consumer's write: straight into the outbound buffers, as the inline multiplexer's are.
+    internal func writeFromStreamConsumer(context: ChannelHandlerContext, frame: HTTP2Frame, promise: EventLoopPromise<Void>?) {
+        self.writeBufferedFrame(context: context, frame: frame, promise: promise)
+    }
+
+    /// The peer's MAX_CONCURRENT_STREAMS as the outbound buffer applies it.
+    internal var streamConsumerMaxOutboundStreams: Int {
+        self.outboundBuffer.maxOutboundStreams
     }
 }
 
@@ -1631,7 +1682,7 @@ extension NIOHTTP2Handler {
         switch inboundStreamMultiplexer {
         case let .inline(multiplexer):
             return StreamMultiplexer(multiplexer, eventLoop: self._eventLoop!)
-        case .legacy:
+        case .legacy, .consumer:
             throw NIOHTTP2Errors.missingMultiplexer()
         }
     }
@@ -1655,7 +1706,7 @@ extension NIOHTTP2Handler {
                 continuation: continuation,
                 inboundStreamChannels: inboundStreamChannels
             )
-        case .legacy:
+        case .legacy, .consumer:
             throw NIOHTTP2Errors.missingMultiplexer()
         }
     }

@@ -43,9 +43,12 @@ extension NIOHTTP2Handler {
     internal enum InboundStreamMultiplexer: HTTP2InboundStreamMultiplexer {
         case legacy(LegacyInboundStreamMultiplexer)
         case inline(InlineStreamMultiplexer)
+        case consumer(ConsumerInboundStreamMultiplexer)
 
         func receivedFrame(_ frame: HTTP2Frame) {
             switch self {
+            case .consumer(let consumer):
+                consumer.receivedFrame(frame)
             case .legacy(let legacyInboundStreamMultiplexer):
                 legacyInboundStreamMultiplexer.receivedFrame(frame)
             case .inline(let inlineStreamMultiplexer):
@@ -55,6 +58,8 @@ extension NIOHTTP2Handler {
 
         func streamError(streamID: HTTP2StreamID, error: Error) {
             switch self {
+            case .consumer(let consumer):
+                consumer.streamError(streamID: streamID, error: error)
             case .legacy(let legacyInboundStreamMultiplexer):
                 legacyInboundStreamMultiplexer.streamError(streamID: streamID, error: error)
             case .inline(let inlineStreamMultiplexer):
@@ -64,6 +69,8 @@ extension NIOHTTP2Handler {
 
         func streamCreated(event: NIOHTTP2StreamCreatedEvent) {
             switch self {
+            case .consumer(let consumer):
+                consumer.streamCreated(event: event)
             case .legacy(let legacyInboundStreamMultiplexer):
                 legacyInboundStreamMultiplexer.streamCreated(event: event)
             case .inline(let inlineStreamMultiplexer):
@@ -73,6 +80,8 @@ extension NIOHTTP2Handler {
 
         func streamClosed(event: StreamClosedEvent) {
             switch self {
+            case .consumer(let consumer):
+                consumer.streamClosed(event: event)
             case .legacy(let legacyInboundStreamMultiplexer):
                 legacyInboundStreamMultiplexer.streamClosed(event: event)
             case .inline(let inlineStreamMultiplexer):
@@ -82,6 +91,8 @@ extension NIOHTTP2Handler {
 
         func streamWindowUpdated(event: NIOHTTP2WindowUpdatedEvent) {
             switch self {
+            case .consumer(let consumer):
+                consumer.streamWindowUpdated(event: event)
             case .legacy(let legacyInboundStreamMultiplexer):
                 legacyInboundStreamMultiplexer.streamWindowUpdated(event: event)
             case .inline(let inlineStreamMultiplexer):
@@ -91,6 +102,8 @@ extension NIOHTTP2Handler {
 
         func initialStreamWindowChanged(event: NIOHTTP2BulkStreamWindowChangeEvent) {
             switch self {
+            case .consumer(let consumer):
+                consumer.initialStreamWindowChanged(event: event)
             case .legacy(let legacyInboundStreamMultiplexer):
                 legacyInboundStreamMultiplexer.initialStreamWindowChanged(event: event)
             case .inline(let inlineStreamMultiplexer):
@@ -105,7 +118,7 @@ extension NIOHTTP2Handler.InboundStreamMultiplexer {
         switch self {
         case .inline(let inlineStreamMultiplexer):
             inlineStreamMultiplexer.propagateChannelActive()
-        case .legacy:
+        case .legacy, .consumer:
             break  // do nothing
         }
     }
@@ -114,7 +127,7 @@ extension NIOHTTP2Handler.InboundStreamMultiplexer {
         switch self {
         case .inline(let inlineStreamMultiplexer):
             inlineStreamMultiplexer.propagateChannelInactive()
-        case .legacy:
+        case .legacy, .consumer:
             break  // do nothing
         }
     }
@@ -123,7 +136,7 @@ extension NIOHTTP2Handler.InboundStreamMultiplexer {
         switch self {
         case .inline(let multiplexer):
             multiplexer.receivedUserInboundEvent(event)
-        case .legacy:
+        case .legacy, .consumer:
             ()  // No-op: already sent down the pipeline by the `NIOHTTP2Handler`.
         }
     }
@@ -132,7 +145,7 @@ extension NIOHTTP2Handler.InboundStreamMultiplexer {
         switch self {
         case .inline(let inlineStreamMultiplexer):
             inlineStreamMultiplexer.propagateChannelWritabilityChanged()
-        case .legacy:
+        case .legacy, .consumer:
             break  // do nothing
         }
     }
@@ -141,7 +154,7 @@ extension NIOHTTP2Handler.InboundStreamMultiplexer {
         switch self {
         case .inline(let inlineStreamMultiplexer):
             inlineStreamMultiplexer.propagateReadComplete()
-        case .legacy:
+        case .legacy, .consumer:
             break  // do nothing
         }
     }
@@ -150,7 +163,7 @@ extension NIOHTTP2Handler.InboundStreamMultiplexer {
         switch self {
         case .inline(let inlineStreamMultiplexer):
             inlineStreamMultiplexer.propagateErrorCaught(error)
-        case .legacy:
+        case .legacy, .consumer:
             break  // do nothing
         }
     }
@@ -159,6 +172,8 @@ extension NIOHTTP2Handler.InboundStreamMultiplexer {
         switch self {
         case .inline(let inlineStreamMultiplexer):
             inlineStreamMultiplexer.propagateHandlerRemoved()
+        case .consumer(let consumer):
+            consumer.consumer._detach()
         case .legacy:
             break  // do nothing
         }
@@ -168,6 +183,8 @@ extension NIOHTTP2Handler.InboundStreamMultiplexer {
         switch self {
         case .inline(let inlineStreamMultiplexer):
             inlineStreamMultiplexer.processedFrame(frame: frame)
+        case .consumer(let consumer):
+            consumer.consumer._processedFrame(frame)
         case .legacy:
             break  // do nothing
         }
@@ -205,5 +222,58 @@ extension LegacyInboundStreamMultiplexer: HTTP2InboundStreamMultiplexer {
 
     func initialStreamWindowChanged(event: NIOHTTP2BulkStreamWindowChangeEvent) {
         self.context.fireUserInboundEventTriggered(event)
+    }
+}
+
+/// Throwaway measurement spike: frames and stream events as typed calls, without the pipeline.
+///
+/// Every frame, root stream included, goes to the consumer and nothing goes down the pipeline as
+/// `channelRead`. Lifecycle events (active, inactive, read complete, writability, errors) still
+/// travel the pipeline. Event loop only.
+@_spi(Spike)
+public protocol _HTTP2FrameConsumer: AnyObject {
+    /// The handler was added: `outbound` writes frames straight into it, bypassing the pipeline.
+    func _attach(_ outbound: NIOHTTP2Handler._ConsumerOutbound)
+    /// The handler was removed: drop `outbound`.
+    func _detach()
+    func _receivedFrame(_ frame: HTTP2Frame)
+    func _streamError(streamID: HTTP2StreamID, error: any Error)
+    func _streamCreated(_ event: NIOHTTP2StreamCreatedEvent)
+    func _streamClosed(_ event: StreamClosedEvent)
+    func _streamWindowUpdated(_ event: NIOHTTP2WindowUpdatedEvent)
+    func _initialStreamWindowChanged(_ event: NIOHTTP2BulkStreamWindowChangeEvent)
+    /// An outbound frame left the handler's buffers (about to be encoded, or dropped). Called
+    /// before the frame is written, so don't write in response from inside this call.
+    func _processedFrame(_ frame: HTTP2Frame)
+}
+
+@usableFromInline
+internal struct ConsumerInboundStreamMultiplexer {
+    let consumer: any _HTTP2FrameConsumer
+}
+
+extension ConsumerInboundStreamMultiplexer: HTTP2InboundStreamMultiplexer {
+    func receivedFrame(_ frame: HTTP2Frame) {
+        self.consumer._receivedFrame(frame)
+    }
+
+    func streamError(streamID: HTTP2StreamID, error: Error) {
+        self.consumer._streamError(streamID: streamID, error: error)
+    }
+
+    func streamCreated(event: NIOHTTP2StreamCreatedEvent) {
+        self.consumer._streamCreated(event)
+    }
+
+    func streamClosed(event: StreamClosedEvent) {
+        self.consumer._streamClosed(event)
+    }
+
+    func streamWindowUpdated(event: NIOHTTP2WindowUpdatedEvent) {
+        self.consumer._streamWindowUpdated(event)
+    }
+
+    func initialStreamWindowChanged(event: NIOHTTP2BulkStreamWindowChangeEvent) {
+        self.consumer._initialStreamWindowChanged(event)
     }
 }

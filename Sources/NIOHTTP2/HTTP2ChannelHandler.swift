@@ -153,6 +153,7 @@ public final class NIOHTTP2Handler: ChannelDuplexHandler {
         }
 
         case uninitializedLegacy
+        case uninitializedConsumer(any _HTTP2FrameConsumer)
         case uninitializedInline(PendingMultiplexerConfig, StreamInitializer)
         case uninitializedAsync(PendingMultiplexerConfig, StreamInitializerWithAnyOutput)
         case initialized(InboundStreamMultiplexer)
@@ -162,7 +163,8 @@ public final class NIOHTTP2Handler: ChannelDuplexHandler {
             switch self {
             case .initialized(let inboundStreamMultiplexer):
                 return inboundStreamMultiplexer
-            case .uninitializedLegacy, .uninitializedInline, .uninitializedAsync, .deinitialized:
+            case .uninitializedLegacy, .uninitializedConsumer, .uninitializedInline, .uninitializedAsync,
+                .deinitialized:
                 return nil
             }
         }
@@ -179,6 +181,10 @@ public final class NIOHTTP2Handler: ChannelDuplexHandler {
                 )
             case .uninitializedLegacy:
                 self = .initialized(.legacy(LegacyInboundStreamMultiplexer(context: context)))
+
+            case .uninitializedConsumer(let consumer):
+                self = .initialized(.consumer(ConsumerInboundStreamMultiplexer(consumer: consumer)))
+                consumer._attach(_ConsumerOutbound(handler: http2Handler, context: context))
 
             case .uninitializedInline(let config, let inboundStreamInitializer):
                 self = .initialized(
@@ -1387,6 +1393,49 @@ extension NIOHTTP2Handler {
 }
 
 extension NIOHTTP2Handler {
+    /// Throwaway measurement spike: a handler with a typed frame consumer instead of a multiplexer.
+    /// Frames and stream events go to `consumer`, not down the pipeline.
+    @_spi(Spike)
+    public convenience init(
+        mode: ParserMode,
+        initialSettings: HTTP2Settings = nioDefaultSettings,
+        consumer: any _HTTP2FrameConsumer
+    ) {
+        self.init(mode: mode, initialSettings: initialSettings)
+        self.inboundStreamMultiplexerState = .uninitializedConsumer(consumer)
+    }
+
+    /// The consumer's way out: writes and flushes go straight into the handler, not through the
+    /// pipeline. Event loop only; valid between `_attach` and `_detach`.
+    @_spi(Spike)
+    public struct _ConsumerOutbound {
+        private let handler: NIOHTTP2Handler
+        private let context: ChannelHandlerContext
+
+        fileprivate init(handler: NIOHTTP2Handler, context: ChannelHandlerContext) {
+            self.handler = handler
+            self.context = context
+        }
+
+        public func write(_ frame: HTTP2Frame, promise: EventLoopPromise<Void>?) {
+            self.handler.writeBufferedFrame(context: self.context, frame: frame, promise: promise)
+        }
+
+        public func flush() {
+            self.handler.flush(context: self.context)
+        }
+
+        public func close() {
+            self.context.close(mode: .all, promise: nil)
+        }
+    }
+}
+
+@_spi(Spike)
+@available(*, unavailable)
+extension NIOHTTP2Handler._ConsumerOutbound: Sendable {}
+
+extension NIOHTTP2Handler {
     /// Exposes restricted API for use by the multiplexer
     internal struct OutboundView {
         private let http2Handler: NIOHTTP2Handler
@@ -1631,7 +1680,7 @@ extension NIOHTTP2Handler {
         switch inboundStreamMultiplexer {
         case let .inline(multiplexer):
             return StreamMultiplexer(multiplexer, eventLoop: self._eventLoop!)
-        case .legacy:
+        case .legacy, .consumer:
             throw NIOHTTP2Errors.missingMultiplexer()
         }
     }
@@ -1655,7 +1704,7 @@ extension NIOHTTP2Handler {
                 continuation: continuation,
                 inboundStreamChannels: inboundStreamChannels
             )
-        case .legacy:
+        case .legacy, .consumer:
             throw NIOHTTP2Errors.missingMultiplexer()
         }
     }

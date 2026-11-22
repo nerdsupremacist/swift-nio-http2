@@ -206,6 +206,7 @@ extension StreamConsumerCore {
     }
 
     /// Assigns the next ID and writes HEADERS. The caller makes the state and runs this inside a batch.
+@usableFromInline
     internal func openLocalStream(headers: HPACKHeaders, endStream: Bool) throws(NIOHTTP2StreamError) -> Int {
         guard self.isActive, !self.isClosed, let handler = self.handler else {
             throw .connectionClosed(underlying: self.connectionError)

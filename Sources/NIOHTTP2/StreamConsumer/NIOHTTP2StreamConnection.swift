@@ -20,8 +20,10 @@ import NIOHPACK
 /// Event loop only: to use it elsewhere, hop with `NIOLoopBound`. It stays safe after the handler is removed: every
 /// method then returns `nil` or throws ``NIOHTTP2StreamError/connectionClosed(underlying:)``.
 public struct NIOHTTP2StreamConnection<Consumer: NIOHTTP2StreamConsumer & ~Copyable> {
+    @usableFromInline
     internal let box: StreamConnectionBox<Consumer>
 
+    @usableFromInline
     internal init(box: StreamConnectionBox<Consumer>) {
         self.box = box
     }
@@ -33,6 +35,7 @@ public struct NIOHTTP2StreamConnection<Consumer: NIOHTTP2StreamConsumer & ~Copya
 
     /// Runs `body` with the streams. Inside a visit or a read batch it joins that batch; otherwise one flush follows,
     /// and a visit if streams have events afterwards. Returns `nil` once closed.
+    @inlinable
     public func withStreams<Result, Failure: Error>(
         _ body: (_ streams: inout NIOHTTP2Streams<Consumer>) throws(Failure) -> Result
     ) throws(Failure) -> Result? {
@@ -45,6 +48,7 @@ public struct NIOHTTP2StreamConnection<Consumer: NIOHTTP2StreamConsumer & ~Copya
 
     /// Runs `body` on one stream, in a batch as ``withStreams(_:)``. Re-entering the stream that is already being
     /// accessed traps, like an exclusivity violation. Returns `nil` for a stale handle or once closed.
+    @inlinable
     public func withStream<Result, Failure: Error>(
         _ handle: NIOHTTP2StreamHandle,
         _ body: (_ stream: inout NIOHTTP2Stream, _ state: inout Consumer.StreamState) throws(Failure) -> Result
@@ -81,6 +85,7 @@ extension NIOHTTP2StreamConnection where Consumer: NIOHTTP2ClientStreamConsumer 
     ///
     /// - Throws: ``NIOHTTP2StreamError``: `.concurrencyLimitReached`, `.goAwayReceived`, `.streamIDsExhausted` or
     ///   `.connectionClosed`. Nothing is written when it throws.
+    @inlinable
     public func openStream(
         headers: HPACKHeaders,
         endStream: Bool,

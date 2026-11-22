@@ -21,12 +21,15 @@ import NIOHPACK
 /// leave in one flush at the end of the outermost access.
 public struct NIOHTTP2Stream: ~Copyable {
     // Valid for the access: the core outlives every access it lends.
+    @usableFromInline
     internal unowned(unsafe) let core: StreamConsumerCore
+    @usableFromInline
     internal let slot: Int
 
     /// The events presented to this visit. Empty outside a visit.
     public let events: NIOHTTP2StreamEvents
 
+    @usableFromInline
     internal init(core: StreamConsumerCore, slot: Int, events: NIOHTTP2StreamEvents) {
         self.core = core
         self.slot = slot
@@ -116,11 +119,13 @@ extension NIOHTTP2Stream: Sendable {}
 /// The streams of a visit or an out-of-band access. Lent `inout` only.
 public struct NIOHTTP2Streams<Consumer: NIOHTTP2StreamConsumer & ~Copyable>: ~Copyable {
     // Strong: an `unowned(unsafe)` reference to a generic class with a noncopyable argument crashes IRGen (Swift 6.4).
+    @usableFromInline
     internal let host: StreamConsumerHost<Consumer>
 
     /// The connection's events since the last visit. Empty outside a visit.
     public let connectionEvents: NIOHTTP2ConnectionEvents
 
+    @usableFromInline
     internal init(host: StreamConsumerHost<Consumer>, connectionEvents: NIOHTTP2ConnectionEvents) {
         self.host = host
         self.connectionEvents = connectionEvents
@@ -143,6 +148,7 @@ public struct NIOHTTP2Streams<Consumer: NIOHTTP2StreamConsumer & ~Copyable>: ~Co
 
     /// Visits the streams with events, oldest first. A visit whose events contain `.closed` is the stream's last: its
     /// state is dropped once `body` returns. If `body` throws, the stream it threw on stays ready for the next visit.
+    @inlinable
     public mutating func forEachReady<Failure: Error>(
         _ body: (_ stream: inout NIOHTTP2Stream, _ state: inout Consumer.StreamState) throws(Failure) -> Void
     ) throws(Failure) {
@@ -159,6 +165,7 @@ public struct NIOHTTP2Streams<Consumer: NIOHTTP2StreamConsumer & ~Copyable>: ~Co
 
     /// Runs `body` on one stream. Re-entering a stream that is already being accessed traps, like an exclusivity
     /// violation. Returns `nil` for a stale handle.
+    @inlinable
     public mutating func withStream<Result, Failure: Error>(
         _ handle: NIOHTTP2StreamHandle,
         _ body: (_ stream: inout NIOHTTP2Stream, _ state: inout Consumer.StreamState) throws(Failure) -> Result

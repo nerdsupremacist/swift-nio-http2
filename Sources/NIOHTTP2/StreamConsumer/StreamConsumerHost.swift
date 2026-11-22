@@ -18,10 +18,13 @@ import NIOCore
 ///
 /// Cycles: the consumer usually holds its `NIOHTTP2StreamConnection`, whose box holds this host. `detach()` (from
 /// `handlerRemoved`) clears the box, and the core drops its reference to the host.
+@usableFromInline
 internal final class StreamConsumerHost<Consumer: NIOHTTP2StreamConsumer & ~Copyable> {
+    @usableFromInline
     internal let core: StreamConsumerCore
     internal let box: StreamConnectionBox<Consumer>
     internal var consumer: Consumer
+    @usableFromInline
     internal var states = StreamStatePages<Consumer.StreamState>()
     private let makeState: ((inout Consumer, inout NIOHTTP2Stream) -> Consumer.StreamState)?
 
@@ -65,6 +68,7 @@ internal final class StreamConsumerHost<Consumer: NIOHTTP2StreamConsumer & ~Copy
     }
 
     /// Lends a stream and its state for one access, inside a batch.
+    @inlinable
     internal func access<Result, Failure: Error>(
         slot: Int,
         events: NIOHTTP2StreamEvents,
@@ -89,7 +93,9 @@ internal final class StreamConsumerHost<Consumer: NIOHTTP2StreamConsumer & ~Copy
 }
 
 /// The connection's handle on its host. Cleared when the handler is removed.
+@usableFromInline
 internal final class StreamConnectionBox<Consumer: NIOHTTP2StreamConsumer & ~Copyable> {
+    @usableFromInline
     internal var host: StreamConsumerHost<Consumer>?
     internal var eventLoop: (any EventLoop)?
 

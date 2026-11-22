@@ -17,10 +17,13 @@
 /// A value's address is stable until the storage is destroyed, so a value can be lent `inout` while other slots are
 /// added (a consumer may open a stream while it's visiting another). Like swift-nio-quic's `PagedBuffer`, this is not
 /// safe by itself: callers must not keep a pointer beyond the access it was made for.
+@usableFromInline
 internal struct StreamStatePages<Element>: ~Copyable {
+    @usableFromInline
     internal static var pageSize: Int { 32 }
 
-    private var pages: [UnsafeMutablePointer<Element?>] = []
+    @usableFromInline
+    internal var pages: [UnsafeMutablePointer<Element?>] = []
 
     internal init() {}
 
@@ -29,6 +32,7 @@ internal struct StreamStatePages<Element>: ~Copyable {
     }
 
     /// The slot's storage, allocating its page first if needed. Valid until the storage is destroyed.
+    @inlinable
     internal mutating func pointer(at index: Int) -> UnsafeMutablePointer<Element?> {
         precondition(index >= 0)
         let page = index / Self.pageSize

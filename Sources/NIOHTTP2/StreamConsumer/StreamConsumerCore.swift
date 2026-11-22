@@ -104,6 +104,7 @@ internal final class StreamConsumerCore {
     internal var connectionWindow: InboundWindowManager
     internal var connectionEvents: NIOHTTP2ConnectionEvents = []
 
+    @usableFromInline
     internal var batchDepth = 0
     internal var needsFlush = false
     internal var isReading = false
@@ -166,6 +167,7 @@ internal final class StreamConsumerCore {
         self.freeSlots.append(slot)
     }
 
+@usableFromInline
     internal func slot(for handle: NIOHTTP2StreamHandle) -> Int? {
         let slot = Int(handle.slot)
         guard slot < self.records.count, self.records[slot].isOccupied,
@@ -176,6 +178,7 @@ internal final class StreamConsumerCore {
         return slot
     }
 
+@usableFromInline
     internal func handle(for slot: Int) -> NIOHTTP2StreamHandle {
         NIOHTTP2StreamHandle(slot: slot, generation: self.records[slot].generation)
     }
@@ -195,12 +198,14 @@ internal final class StreamConsumerCore {
     // Visits and batches.
 
     /// Starts one stream's visit: takes its events and marks it accessed. The caller ends it with `endVisit`.
+@usableFromInline
     internal func beginAccess(_ slot: Int) {
         precondition(!self.records[slot].isAccessed, "This stream is already in use.")
         self.records[slot].isAccessed = true
     }
 
     /// Ends an access: releases the held write. Returns true if the visit presented `.closed` and the slot is now free.
+@usableFromInline
     internal func endAccess(_ slot: Int, presented events: NIOHTTP2StreamEvents) -> Bool {
         self.records[slot].isAccessed = false
         self.releaseHeldWrite(slot)
@@ -211,6 +216,7 @@ internal final class StreamConsumerCore {
         return false
     }
 
+@usableFromInline
     internal func dequeueReady() -> (slot: Int, events: NIOHTTP2StreamEvents)? {
         guard let slot = self.ready.popFirst() else { return nil }
         self.records[slot].isQueued = false
@@ -219,12 +225,14 @@ internal final class StreamConsumerCore {
         return (slot, events)
     }
 
+@usableFromInline
     internal func requeueFront(_ slot: Int, events: NIOHTTP2StreamEvents) {
         self.records[slot].events.formUnion(events)
         self.records[slot].isQueued = true
         self.ready.prepend(slot)
     }
 
+    @inlinable
     internal func withBatch<Result, Failure: Error>(_ body: () throws(Failure) -> Result) throws(Failure) -> Result {
         self.batchDepth += 1
         defer {
@@ -236,7 +244,8 @@ internal final class StreamConsumerCore {
         return try body()
     }
 
-    private func endBatch() {
+@usableFromInline
+    internal func endBatch() {
         self.flushIfNeeded()
         self.visitIfNeeded()
     }

@@ -218,6 +218,34 @@ struct StreamConsumerTests {
         #expect(observed.events.contains(.localEndSent))
     }
 
+    @Test(
+        "A body that arrives whole is echoed without a WINDOW_UPDATE after the peer's end",
+        arguments: [5, 40_000, 50_000, 60_000]
+    )
+    func bodyArrivingInOneRead(size: Int) throws {
+        let pair = try ConsumerPair()
+        let observed = ObservedStream()
+        let body = ByteBuffer(repeating: 0x42, count: size)
+        let handle = try pair.open(observed, endStream: false)
+        try pair.connection.withStream(handle) { stream, _ in
+            try stream.writeData(body)
+            try stream.writeEnd()
+        }
+        // HEADERS and the whole body reach the server as one read.
+        var batch = ByteBuffer()
+        while let data = try pair.client.readOutbound(as: IOData.self) {
+            if case .byteBuffer(var buffer) = data { batch.writeBuffer(&buffer) }
+        }
+        try pair.server.writeInbound(batch)
+        try pair.interact()
+
+        #expect(observed.status == "200")
+        #expect(observed.body == body)
+        if case .ended = observed.closeReason {} else {
+            Issue.record("closed with \(String(describing: observed.closeReason))")
+        }
+    }
+
     @Test("Root-stream frames still reach the pipeline")
     func rootFramesReachThePipeline() throws {
         let pair = try ConsumerPair()

@@ -384,12 +384,19 @@ extension StreamConsumerCore: HTTP2InboundStreamMultiplexer {
         }
         guard let slot, self.records[slot].closeReason == nil else { return }
 
+        let endStream: Bool
         switch part {
-        case .data(let buffer, let endStream):
+        case .data(let buffer, let end):
             self.records[slot].window.bufferedFrameReceived(size: buffer.readableBytes)
-            if endStream { self.records[slot].inboundComplete = true }
-        case .headers(_, let endStream):
-            if endStream { self.records[slot].inboundComplete = true }
+            endStream = end
+        case .headers(_, let end):
+            endStream = end
+        }
+        if endStream {
+            self.records[slot].inboundComplete = true
+            // The peer won't send more: no WINDOW_UPDATE for this stream from now on (nio-http2 rejects one on a
+            // half-closed stream), as the child channel does.
+            self.records[slot].window.closed = true
         }
         self.records[slot].inbound.append(part)
         self.markReady(slot, .readable)

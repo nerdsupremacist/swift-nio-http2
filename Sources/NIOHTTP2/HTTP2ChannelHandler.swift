@@ -993,6 +993,7 @@ extension NIOHTTP2Handler {
                 self.processOutboundFrame(context: context, frame: frame, promise: promise)
                 for (droppedFrame, promise) in framesToDrop {
                     self.inboundStreamMultiplexer?.processedFrame(droppedFrame)
+                    self.streamConsumerWriteFailed(droppedFrame, error)
                     promise?.fail(error)
                 }
             case .succeedAndDrop(let framesToDrop, let error):
@@ -1000,6 +1001,7 @@ extension NIOHTTP2Handler {
                 // promises in order.
                 for (droppedFrame, promise) in framesToDrop {
                     self.inboundStreamMultiplexer?.processedFrame(droppedFrame)
+                    self.streamConsumerWriteFailed(droppedFrame, error)
                     promise?.fail(error)
                 }
                 self.inboundStreamMultiplexer?.processedFrame(frame)
@@ -1007,6 +1009,7 @@ extension NIOHTTP2Handler {
             }
         } catch let error where error is NIOHTTP2Errors.ExcessiveOutboundFrameBuffering {
             self.inboundStreamMultiplexer?.processedFrame(frame)
+            self.streamConsumerWriteFailed(frame, error)
             self.inboundConnectionErrorTriggered(
                 context: context,
                 underlyingError: error,
@@ -1015,6 +1018,7 @@ extension NIOHTTP2Handler {
             )
         } catch {
             self.inboundStreamMultiplexer?.processedFrame(frame)
+            self.streamConsumerWriteFailed(frame, error)
             promise?.fail(error)
         }
     }
@@ -1087,7 +1091,7 @@ extension NIOHTTP2Handler {
         case .ignoreFrame:
             preconditionFailure("Cannot be asked to ignore outbound frames.")
         case .connectionError(let underlyingError, _, _):
-            self.outboundConnectionErrorTriggered(context: context, promise: promise, underlyingError: underlyingError)
+            self.outboundConnectionErrorTriggered(context: context, frame: frame, promise: promise, underlyingError: underlyingError)
             return
         case .streamError(let streamID, let underlyingError, _):
             self.outboundStreamErrorTriggered(
@@ -1119,12 +1123,13 @@ extension NIOHTTP2Handler {
         } catch InternalError.codecError {
             self.outboundConnectionErrorTriggered(
                 context: context,
+                frame: frame,
                 promise: promise,
                 underlyingError: NIOHTTP2Errors.unableToSerializeFrame()
             )
             return
         } catch {
-            self.outboundConnectionErrorTriggered(context: context, promise: promise, underlyingError: error)
+            self.outboundConnectionErrorTriggered(context: context, frame: frame, promise: promise, underlyingError: error)
             return
         }
 
@@ -1150,9 +1155,11 @@ extension NIOHTTP2Handler {
     /// A connection error was hit while attempting to send a frame.
     private func outboundConnectionErrorTriggered(
         context: ChannelHandlerContext,
+        frame: HTTP2Frame,
         promise: EventLoopPromise<Void>?,
         underlyingError: Error
     ) {
+        self.streamConsumerWriteFailed(frame, underlyingError)
         promise?.fail(underlyingError)
         context.fireErrorCaught(underlyingError)
     }
@@ -1429,6 +1436,13 @@ extension NIOHTTP2Handler {
     /// A consumer's write: straight into the outbound buffers, as the inline multiplexer's are.
     internal func writeFromStreamConsumer(context: ChannelHandlerContext, frame: HTTP2Frame, promise: EventLoopPromise<Void>?) {
         self.writeBufferedFrame(context: context, frame: frame, promise: promise)
+    }
+
+    /// A frame of a consumer stream was dropped or failed before it reached the wire: close that stream.
+    private func streamConsumerWriteFailed(_ frame: HTTP2Frame, _ error: any Error) {
+        if case .consumer(let core) = self.inboundStreamMultiplexer {
+            core.outboundFailed(frame, error: error)
+        }
     }
 
     /// The peer's MAX_CONCURRENT_STREAMS as the outbound buffer applies it.

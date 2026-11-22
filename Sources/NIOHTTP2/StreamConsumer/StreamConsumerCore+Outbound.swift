@@ -156,6 +156,16 @@ extension StreamConsumerCore {
         }
     }
 
+    /// The handler dropped or failed one of a stream's frames before it reached the wire. The stream won't make progress
+    /// (a failed HEADERS leaves it open inside nio-http2), so its next visit is its last. Frames dropped by the consumer's
+    /// own reset keep the reset as the reason.
+    internal func outboundFailed(_ frame: HTTP2Frame, error: any Error) {
+        guard frame.streamID != .rootStream, let slot = self.slotByID[frame.streamID],
+            !self.records[slot].localReset
+        else { return }
+        self.close(slot, reason: .writeFailed(underlying: error))
+    }
+
     /// The handler flushed: every END encoded before it is now `.localEndSent`.
     internal func didFlush() {
         guard !self.encodedEnds.isEmpty else { return }

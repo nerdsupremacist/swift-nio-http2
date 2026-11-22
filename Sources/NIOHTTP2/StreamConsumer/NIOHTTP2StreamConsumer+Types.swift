@@ -85,6 +85,8 @@ public enum NIOHTTP2StreamCloseReason: Sendable {
     case refused(lastStreamID: HTTP2StreamID)
     /// The connection closed or failed.
     case connectionClosed(underlying: (any Error)?)
+    /// nio-http2 couldn't write one of the stream's frames (for example a header block it can't encode).
+    case writeFailed(underlying: any Error)
 }
 
 /// Errors from opening and writing consumer streams.

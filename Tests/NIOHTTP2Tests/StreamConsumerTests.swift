@@ -246,6 +246,23 @@ struct StreamConsumerTests {
         }
     }
 
+    @Test("A HEADERS block nio-http2 can't encode closes the stream instead of leaving it open")
+    func unencodableHeadersCloseTheStream() throws {
+        let pair = try ConsumerPair()
+        let observed = ObservedStream()
+        // Larger than SETTINGS_MAX_FRAME_SIZE once HPACK-encoded, and nio-http2 doesn't write CONTINUATION frames.
+        var headers: HPACKHeaders = [":method": "GET", ":path": "/", ":scheme": "https", ":authority": "localhost"]
+        headers.add(name: "x-big", value: String(repeating: "a", count: 40_000), indexing: .neverIndexed)
+        _ = try pair.connection.openStream(headers: headers, endStream: true) { _ in observed }
+        try pair.interact()
+
+        #expect(observed.events.contains(.closed))
+        if case .writeFailed = observed.closeReason {} else {
+            Issue.record("closed with \(String(describing: observed.closeReason))")
+        }
+        #expect(pair.clientCore.openLocalStreams == 0)
+    }
+
     @Test("Root-stream frames still reach the pipeline")
     func rootFramesReachThePipeline() throws {
         let pair = try ConsumerPair()

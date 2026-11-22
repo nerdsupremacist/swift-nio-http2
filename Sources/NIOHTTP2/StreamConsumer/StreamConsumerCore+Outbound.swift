@@ -39,7 +39,7 @@ extension StreamConsumerCore {
         )
     }
 
-    internal func writeData(_ slot: Int, _ data: ByteBuffer) throws(NIOHTTP2StreamError) {
+    internal func writeData(_ slot: Int, _ data: IOData) throws(NIOHTTP2StreamError) {
         guard self.canWrite(slot) else { throw .writeOutOfOrder }
         self.releaseHeldWrite(slot)
         self.records[slot].pendingBytes += data.readableBytes
@@ -47,7 +47,7 @@ extension StreamConsumerCore {
             self.records[slot].isAboveHighWatermark = true
         }
         self.records[slot].held = HeldWrite(
-            payload: .data(.init(data: .byteBuffer(data))),
+            payload: .data(.init(data: data)),
             promise: self.takeCompletion(slot)
         )
     }

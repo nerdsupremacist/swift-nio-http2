@@ -80,6 +80,11 @@ public struct NIOHTTP2Stream: ~Copyable {
 
     /// Writes body bytes.
     public mutating func writeData(_ data: ByteBuffer) throws(NIOHTTP2StreamError) {
+        try self.core.writeData(self.slot, .byteBuffer(data))
+    }
+
+    /// Writes body bytes or a file region (sent without copying, as with a stream channel).
+    public mutating func writeData(_ data: IOData) throws(NIOHTTP2StreamError) {
         try self.core.writeData(self.slot, data)
     }
 

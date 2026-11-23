@@ -440,11 +440,7 @@ struct StreamConsumerTests {
 struct StreamStatePagesTests {
     @Test("Addresses stay stable while pages are added")
     func stableAddresses() {
-        #if compiler(>=6.4)
-        var pages = StreamStatePages<Int>()
-        #else
         let pages = StreamStatePages<Int>()
-        #endif
         let first = pages.pointer(at: 0)
         first.pointee = 42
         for index in 1..<200 {

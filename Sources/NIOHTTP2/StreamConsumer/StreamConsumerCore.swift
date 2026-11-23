@@ -124,6 +124,7 @@ internal final class StreamConsumerCore {
     internal var nextStreamID: Int
     internal var openLocalStreams = 0
     internal var goAwayLastStreamID: HTTP2StreamID?
+    internal var highestPeerStreamID = HTTP2StreamID.rootStream
     internal var needsGoAwaySweep = false
     internal var lastOpenableCount = 0
 
@@ -223,11 +224,16 @@ internal final class StreamConsumerCore {
 
 @usableFromInline
     internal func dequeueReady() -> (slot: Int, events: NIOHTTP2StreamEvents)? {
-        guard let slot = self.ready.popFirst() else { return nil }
-        self.records[slot].isQueued = false
-        let events = self.records[slot].events
-        self.records[slot].events = []
-        return (slot, events)
+        // A slot freed while queued (an event arrived during its final access) leaves its index behind, and so does a
+        // freed slot queued again for its next stream. Only entries whose record is still queued are visits.
+        while let slot = self.ready.popFirst() {
+            guard self.records[slot].isQueued else { continue }
+            self.records[slot].isQueued = false
+            let events = self.records[slot].events
+            self.records[slot].events = []
+            return (slot, events)
+        }
+        return nil
     }
 
 @usableFromInline
@@ -453,6 +459,7 @@ extension StreamConsumerCore: HTTP2InboundStreamMultiplexer {
     private func openPeerStream(_ id: HTTP2StreamID) -> Int? {
         guard let host = self.host else { return nil }
         let slot = self.allocateSlot(id: id, isLocal: false)
+        self.highestPeerStreamID = max(self.highestPeerStreamID, id)
         self.records[slot].events = [.opened]
         host.makePeerStreamState(slot)
         return slot

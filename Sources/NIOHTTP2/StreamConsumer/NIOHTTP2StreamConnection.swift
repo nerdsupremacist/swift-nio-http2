@@ -59,14 +59,16 @@ public struct NIOHTTP2StreamConnection<Consumer: NIOHTTP2StreamConsumer & ~Copya
         }
     }
 
-    /// Sends GOAWAY with the highest stream ID the peer opened so far.
+    /// Sends GOAWAY naming the highest stream ID the peer opened so far: its streams up to there finish, newer ones are
+    /// refused.
     public func sendGoAway(errorCode: HTTP2ErrorCode) {
         guard let host = self.box.host else { return }
+        let lastStreamID = host.core.highestPeerStreamID
         host.core.withBatch {
             host.core.write(
                 HTTP2Frame(
                     streamID: .rootStream,
-                    payload: .goAway(lastStreamID: .maxID, errorCode: errorCode, opaqueData: nil)
+                    payload: .goAway(lastStreamID: lastStreamID, errorCode: errorCode, opaqueData: nil)
                 ),
                 promise: nil
             )
@@ -96,8 +98,12 @@ extension NIOHTTP2StreamConnection where Consumer: NIOHTTP2ClientStreamConsumer 
         return try core.withBatch { () throws(NIOHTTP2StreamError) -> NIOHTTP2StreamHandle in
             let slot = try core.openLocalStream(headers: headers, endStream: endStream)
             let handle = core.handle(for: slot)
+            // An access like any other, so re-entering this stream from `makeState` traps instead of finding no state.
+            core.beginAccess(slot)
             var stream = NIOHTTP2Stream(core: core, slot: slot, events: [.opened])
-            host.states.pointer(at: slot).pointee = makeState(&stream)
+            let state = makeState(&stream)
+            _ = core.endAccess(slot, presented: [])
+            host.states.pointer(at: slot).pointee = state
             return handle
         }
     }

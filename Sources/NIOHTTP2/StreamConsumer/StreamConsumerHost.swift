@@ -49,8 +49,11 @@ internal final class StreamConsumerHost<Consumer: NIOHTTP2StreamConsumer & ~Copy
 
     internal func makePeerStreamState(slot: Int) {
         guard let makeState = self.makeState else { return }
+        // An access like any other, so re-entering this stream from `makeStreamState` traps instead of finding no state.
+        self.core.beginAccess(slot)
         var stream = NIOHTTP2Stream(core: self.core, slot: slot, events: [.opened])
         let state = makeState(&self.consumer, &stream)
+        _ = self.core.endAccess(slot, presented: [])
         self.states.pointer(at: slot).pointee = state
     }
 

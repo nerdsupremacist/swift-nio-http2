@@ -24,6 +24,7 @@ final class ConsumerLog {
     var visits = 0
     var streamsPerVisit: [Int] = []
     var connectionEvents: NIOHTTP2ConnectionEvents = []
+    var makeStateWasAccess: [Bool] = []
 }
 
 /// A client stream's observed parts and events.
@@ -79,7 +80,8 @@ struct EchoServerConsumer: NIOHTTP2ServerStreamConsumer {
     let log: ConsumerLog
 
     mutating func makeStreamState(for stream: inout NIOHTTP2Stream) -> StreamState {
-        StreamState()
+        self.log.makeStateWasAccess.append(stream.core.records[stream.slot].isAccessed)
+        return StreamState()
     }
 
     mutating func processStreams(_ streams: inout NIOHTTP2Streams<EchoServerConsumer>) {
@@ -121,6 +123,7 @@ struct ConsumerPair {
     let clientLog = ConsumerLog()
     let serverLog = ConsumerLog()
     let connection: NIOHTTP2StreamConnection<TestClientConsumer>
+    let serverConnection: NIOHTTP2StreamConnection<EchoServerConsumer>
     let recorder = RootFrameRecorder()
 
     init(
@@ -138,7 +141,9 @@ struct ConsumerPair {
         try self.client.pipeline.syncOperations.addHandler(self.recorder)
         var serverConfiguration = NIOHTTP2Handler.Configuration()
         serverConfiguration.connection.initialSettings = serverSettings
-        _ = try self.server.pipeline.syncOperations.configureHTTP2Connection(configuration: serverConfiguration) { _ in
+        self.serverConnection = try self.server.pipeline.syncOperations.configureHTTP2Connection(
+            configuration: serverConfiguration
+        ) { _ in
             EchoServerConsumer(log: serverLog)
         }
         if connect {
@@ -424,6 +429,58 @@ struct StreamConsumerTests {
         try pair.client.writeInbound(again)
         #expect(pair.clientCore.openLocalStreams == 0)
         #expect(pair.connection.openableStreamCount == 0)
+    }
+
+    @Test("A slot freed while it was queued is never visited again, not even after reuse")
+    func freedSlotLeavesTheReadyList() throws {
+        let core = StreamConsumerCore(isClient: true, configuration: .init(), pipelineEvents: .none)
+        let slot = core.allocateSlot(id: 1, isLocal: true)
+        core.markReady(slot, .closed)
+        let (dequeued, events) = try #require(core.dequeueReady())
+        core.beginAccess(dequeued)
+        // An event arriving during the stream's final access queues the slot again.
+        core.markReady(dequeued, .readable)
+        #expect(core.endAccess(dequeued, presented: events))
+        #expect(core.dequeueReady() == nil)
+
+        // The next stream in that slot is visited once, with its own events.
+        let reused = core.allocateSlot(id: 3, isLocal: true)
+        #expect(reused == slot)
+        core.markReady(reused, .readable)
+        #expect(core.dequeueReady()?.events == .readable)
+        #expect(core.dequeueReady() == nil)
+    }
+
+    @Test("makeState runs inside an access of its stream, on clients and servers")
+    func makeStateIsAnAccess() throws {
+        let pair = try ConsumerPair()
+        var accessed: Bool?
+        let headers: HPACKHeaders = [":method": "GET", ":path": "/", ":scheme": "https", ":authority": "localhost"]
+        _ = try pair.connection.openStream(headers: headers, endStream: true) { stream in
+            accessed = stream.core.records[stream.slot].isAccessed
+            return ObservedStream()
+        }
+        #expect(accessed == true)
+
+        // Servers: the peer's stream is made inside an access too.
+        try pair.interact()
+        #expect(pair.serverLog.makeStateWasAccess == [true])
+    }
+
+    @Test("sendGoAway names the highest stream the peer opened")
+    func sendGoAwayLastStreamID() throws {
+        let pair = try ConsumerPair()
+        _ = try pair.open(ObservedStream(), endStream: false)
+        _ = try pair.open(ObservedStream(), endStream: false)
+        try pair.interact()
+        pair.serverConnection.sendGoAway(errorCode: .noError)
+        try pair.interact()
+
+        let lastStreamIDs = pair.recorder.frames.compactMap { frame -> HTTP2StreamID? in
+            if case .goAway(let lastStreamID, _, _) = frame.payload { return lastStreamID }
+            return nil
+        }
+        #expect(lastStreamIDs == [3])
     }
 
     @Test("Stale handles resolve to nothing")

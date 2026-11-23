@@ -177,6 +177,23 @@ struct ConsumerPair {
         return try self.connection.openStream(headers: headers, endStream: endStream) { _ in observed }
     }
 
+    /// Decodes and removes the frames the client has written so far.
+    func drainClientFrames() throws -> [HTTP2Frame] {
+        var decoder = HTTP2FrameDecoder(
+            allocator: ByteBufferAllocator(),
+            expectClientMagic: false,
+            maximumSequentialContinuationFrames: 5
+        )
+        while let data = try self.client.readOutbound(as: IOData.self) {
+            if case .byteBuffer(let buffer) = data { decoder.append(bytes: buffer) }
+        }
+        var frames: [HTTP2Frame] = []
+        while let (frame, _) = try decoder.nextFrame() {
+            frames.append(frame)
+        }
+        return frames
+    }
+
     var clientCore: StreamConsumerCore {
         let handler = try! self.client.pipeline.syncOperations.handler(type: NIOHTTP2Handler.self)
         guard case .consumer(let core) = handler.inboundStreamMultiplexer else { fatalError("not a consumer handler") }
@@ -261,6 +278,26 @@ struct StreamConsumerTests {
             Issue.record("closed with \(String(describing: observed.closeReason))")
         }
         #expect(pair.clientCore.openLocalStreams == 0)
+    }
+
+    @Test("A write and the end in separate accesses of one batch leave as one DATA frame with END_STREAM")
+    func endFoldsAcrossAccessesOfABatch() throws {
+        let pair = try ConsumerPair()
+        let handle = try pair.open(ObservedStream(), endStream: false)
+        _ = try pair.drainClientFrames()
+
+        pair.connection.withStreams { streams in
+            _ = try? streams.withStream(handle) { stream, _ in try stream.writeData(ByteBuffer(string: "hello")) }
+            _ = try? streams.withStream(handle) { stream, _ in try stream.writeEnd() }
+        }
+
+        let data = try pair.drainClientFrames().compactMap { frame -> (Int, Bool)? in
+            guard case .data(let payload) = frame.payload else { return nil }
+            return (payload.data.readableBytes, payload.endStream)
+        }
+        #expect(data.count == 1)
+        #expect(data.first?.0 == 5)
+        #expect(data.first?.1 == true)
     }
 
     @Test("Root-stream frames still reach the pipeline")

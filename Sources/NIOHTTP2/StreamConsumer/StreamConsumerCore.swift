@@ -37,6 +37,7 @@ internal final class StreamConsumerCore {
         var inboundComplete = false
         var window: InboundWindowManager
         var held: HeldWrite?
+        var isListedForHeldWrite = false
         var localEndWritten = false
         var localEndEncoded = false
         var localReset = false
@@ -63,6 +64,7 @@ internal final class StreamConsumerCore {
             self.inboundComplete = false
             self.window = InboundWindowManager(targetSize: targetWindowSize)
             self.held = nil
+            self.isListedForHeldWrite = false
             self.localEndWritten = false
             self.localEndEncoded = false
             self.localReset = false
@@ -101,6 +103,10 @@ internal final class StreamConsumerCore {
     internal var ready = CircularBuffer<Int>(initialCapacity: 16)
     internal var readyVersion = 0
     internal var encodedEnds: [Int] = []
+    /// Streams with a held write, released at the end of the outermost batch so END_STREAM folds across accesses.
+    internal var heldWriteSlots: [Int] = []
+    /// Streams whose only new event is `.localEndSent`: delivered with their next visit, never a visit of their own.
+    internal var lazyReady: [Int] = []
     internal var connectionWindow: InboundWindowManager
     internal var connectionEvents: NIOHTTP2ConnectionEvents = []
 
@@ -208,7 +214,6 @@ internal final class StreamConsumerCore {
 @usableFromInline
     internal func endAccess(_ slot: Int, presented events: NIOHTTP2StreamEvents) -> Bool {
         self.records[slot].isAccessed = false
-        self.releaseHeldWrite(slot)
         if events.contains(.closed) {
             self.freeSlot(slot)
             return true
@@ -246,8 +251,24 @@ internal final class StreamConsumerCore {
 
 @usableFromInline
     internal func endBatch() {
+        self.releaseHeldWrites()
         self.flushIfNeeded()
         self.visitIfNeeded()
+    }
+
+    /// Writes every held frame: END_STREAM can no longer fold into them once the batch ends.
+    internal func releaseHeldWrites() {
+        guard !self.heldWriteSlots.isEmpty else { return }
+        var index = 0
+        while index < self.heldWriteSlots.count {
+            let slot = self.heldWriteSlots[index]
+            index += 1
+            self.records[slot].isListedForHeldWrite = false
+            if self.records[slot].isOccupied {
+                self.releaseHeldWrite(slot)
+            }
+        }
+        self.heldWriteSlots.removeAll(keepingCapacity: true)
     }
 
     internal func flushIfNeeded() {
@@ -268,11 +289,13 @@ internal final class StreamConsumerCore {
             let version = self.readyVersion
             rounds += 1
             self.visitCount += 1
+            self.mergeLazyReady()
             self.isVisiting = true
             self.batchDepth += 1
             host.visit()
             self.batchDepth -= 1
             self.isVisiting = false
+            self.releaseHeldWrites()
             self.flushIfNeeded()
             if self.readyVersion == version && self.connectionEvents.isEmpty {
                 break
@@ -286,8 +309,24 @@ internal final class StreamConsumerCore {
         self.isActive = true
     }
 
+    /// Brings the streams with only `.localEndSent` into the visit that is about to run.
+    private func mergeLazyReady() {
+        guard !self.lazyReady.isEmpty else { return }
+        for slot in self.lazyReady where self.records[slot].isOccupied && !self.records[slot].isQueued
+            && !self.records[slot].events.isEmpty
+        {
+            self.records[slot].isQueued = true
+            self.ready.append(slot)
+        }
+        self.lazyReady.removeAll(keepingCapacity: true)
+    }
+
     internal func readComplete() {
         self.isReading = false
+        if !self.heldWriteSlots.isEmpty {
+            // Writes made during the read (for example in `makeStreamState`) leave now.
+            self.withBatch {}
+        }
         if self.needsGoAwaySweep {
             self.needsGoAwaySweep = false
             self.withBatch { self.sweepAboveGoAway() }

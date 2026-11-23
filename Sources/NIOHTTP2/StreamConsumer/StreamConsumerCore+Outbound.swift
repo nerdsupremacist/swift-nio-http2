@@ -37,6 +37,7 @@ extension StreamConsumerCore {
             payload: .headers(.init(headers: headers)),
             promise: self.takeCompletion(slot)
         )
+        self.listHeldWrite(slot)
     }
 
     internal func writeData(_ slot: Int, _ data: IOData) throws(NIOHTTP2StreamError) {
@@ -50,6 +51,13 @@ extension StreamConsumerCore {
             payload: .data(.init(data: data)),
             promise: self.takeCompletion(slot)
         )
+        self.listHeldWrite(slot)
+    }
+
+    private func listHeldWrite(_ slot: Int) {
+        guard !self.records[slot].isListedForHeldWrite else { return }
+        self.records[slot].isListedForHeldWrite = true
+        self.heldWriteSlots.append(slot)
     }
 
     /// Folds END_STREAM into the held frame, or sends trailers, or an empty DATA frame.
@@ -174,12 +182,11 @@ extension StreamConsumerCore {
                 self.records[slot].completion = nil
                 completion.succeed()
             }
-            self.markReady(slot, .localEndSent)
+            // No visit of its own: it arrives with the stream's next visit (for a client, its response).
+            self.records[slot].events.insert(.localEndSent)
+            self.lazyReady.append(slot)
         }
         self.encodedEnds.removeAll(keepingCapacity: true)
-        if !self.isFlushing {
-            self.visitIfNeeded()
-        }
     }
 }
 

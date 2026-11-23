@@ -886,6 +886,9 @@ extension NIOHTTP2Handler {
         // A stream error brings down a single stream, causing a RST_STREAM frame. We attempt to write this, and then report
         // the error. It's possible that we'll be unable to write this, which will likely escalate this error, but that's
         // the user's issue.
+        if case .consumer(let core) = self.inboundStreamMultiplexer {
+            core.handlerResetsStream(streamID)
+        }
         let rstStreamFrame = HTTP2Frame(streamID: streamID, payload: .rstStream(reason))
         self.writeBufferedFrame(context: context, frame: rstStreamFrame, promise: nil)
         self.flushIfNecessary(context: context)

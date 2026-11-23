@@ -44,7 +44,7 @@ extension StreamConsumerCore {
         guard self.canWrite(slot) else { throw .writeOutOfOrder }
         self.releaseHeldWrite(slot)
         self.records[slot].pendingBytes += data.readableBytes
-        if self.records[slot].pendingBytes > self.highWatermark {
+        if self.records[slot].pendingBytes >= self.highWatermark {
             self.records[slot].isAboveHighWatermark = true
         }
         self.records[slot].held = HeldWrite(
@@ -66,10 +66,16 @@ extension StreamConsumerCore {
         self.records[slot].localEndWritten = true
         let id = self.records[slot].id
         if let trailers {
-            self.releaseHeldWrite(slot)
+            // The trailers are now the stream's latest write: a completion waiting on the held frame moves to them.
+            var promise = self.records[slot].held?.promise
+            if let held = self.records[slot].held {
+                self.records[slot].held = nil
+                self.write(HTTP2Frame(streamID: id, payload: held.payload), promise: nil)
+            }
+            promise.setOrCascade(to: self.takeCompletion(slot))
             self.write(
                 HTTP2Frame(streamID: id, payload: .headers(.init(headers: trailers, endStream: true))),
-                promise: self.takeCompletion(slot)
+                promise: promise
             )
             return
         }
@@ -104,6 +110,8 @@ extension StreamConsumerCore {
     internal func completeWhenWritten(_ slot: Int, _ promise: EventLoopPromise<Void>) {
         if self.records[slot].closeReason != nil {
             promise.fail(NIOHTTP2StreamError.connectionClosed(underlying: nil))
+        } else if self.records[slot].localEndFlushed {
+            promise.succeed()
         } else if self.records[slot].held != nil {
             self.records[slot].held!.promise.setOrCascade(to: promise)
         } else if self.records[slot].localEndWritten {
@@ -123,10 +131,8 @@ extension StreamConsumerCore {
 
     internal func resetStream(_ slot: Int, code: HTTP2ErrorCode) {
         guard self.records[slot].closeReason == nil else { return }
-        if let held = self.records[slot].held {
-            self.records[slot].held = nil
-            held.promise?.fail(NIOHTTP2StreamError.writeOutOfOrder)
-        }
+        let heldPromise = self.records[slot].held?.promise
+        self.records[slot].held = nil
         self.records[slot].localReset = true
         let wasCreated = self.records[slot].isCreated || !self.records[slot].isLocal
         self.write(HTTP2Frame(streamID: self.records[slot].id, payload: .rstStream(code)), promise: nil)
@@ -134,6 +140,8 @@ extension StreamConsumerCore {
             // HEADERS still buffered inside nio-http2: the RST dropped them, and no close event follows.
             self.close(slot, reason: .reset(code, byPeer: false))
         }
+        // Last: a callback can't write ahead of the RST any more.
+        heldPromise?.fail(NIOHTTP2StreamError.writeOutOfOrder)
     }
 
     internal func writableBytes(_ slot: Int) -> Int {
@@ -182,6 +190,7 @@ extension StreamConsumerCore {
                 self.records[slot].completion = nil
                 completion.succeed()
             }
+            self.records[slot].localEndFlushed = true
             // No visit of its own: it arrives with the stream's next visit (for a client, its response).
             self.records[slot].events.insert(.localEndSent)
             self.lazyReady.append(slot)

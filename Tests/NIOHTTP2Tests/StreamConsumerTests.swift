@@ -25,6 +25,7 @@ final class ConsumerLog {
     var streamsPerVisit: [Int] = []
     var connectionEvents: NIOHTTP2ConnectionEvents = []
     var makeStateWasAccess: [Bool] = []
+    var closeReasons: [NIOHTTP2StreamCloseReason?] = []
 }
 
 /// A client stream's observed parts and events.
@@ -101,6 +102,9 @@ struct EchoServerConsumer: NIOHTTP2ServerStreamConsumer {
                     try? stream.writeData(data)
                     if endStream { try? stream.writeEnd() }
                 }
+            }
+            if stream.events.contains(.closed) {
+                self.log.closeReasons.append(stream.closeReason)
             }
         }
         self.log.streamsPerVisit.append(count)
@@ -205,6 +209,93 @@ struct ConsumerPair {
         return core
     }
 }
+
+/// Writes a stream's body in chunks whenever it has room below the high watermark, then the end.
+struct ChunkWriterConsumer: NIOHTTP2ClientStreamConsumer {
+    final class StreamState {
+        var left: Int
+        let chunk: Int
+        init(left: Int, chunk: Int) {
+            self.left = left
+            self.chunk = chunk
+        }
+    }
+
+    mutating func processStreams(_ streams: inout NIOHTTP2Streams<ChunkWriterConsumer>) {
+        streams.forEachReady { stream, state in Self.write(&stream, state) }
+    }
+
+    static func write(_ stream: inout NIOHTTP2Stream, _ state: StreamState) {
+        while state.left > 0, stream.writableBytes > 0 {
+            let size = min(state.chunk, state.left)
+            try? stream.writeData(ByteBuffer(repeating: 0, count: size))
+            state.left -= size
+        }
+        if state.left == 0, !stream.isOutboundComplete {
+            try? stream.writeEnd()
+        }
+    }
+
+    /// A connected client with no server (nio-http2 sends on the default settings) and small watermarks.
+    static func connect(
+        high: Int,
+        low: Int
+    ) throws -> (EmbeddedChannel, NIOHTTP2StreamConnection<ChunkWriterConsumer>) {
+        let channel = EmbeddedChannel()
+        var configuration = NIOHTTP2Handler.Configuration()
+        configuration.stream.outboundBufferSizeHighWatermark = high
+        configuration.stream.outboundBufferSizeLowWatermark = low
+        let connection = try channel.pipeline.syncOperations.configureHTTP2Connection(configuration: configuration) {
+            _ in ChunkWriterConsumer()
+        }
+        try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
+        return (channel, connection)
+    }
+
+    static func open(
+        _ connection: NIOHTTP2StreamConnection<ChunkWriterConsumer>,
+        _ state: StreamState
+    ) throws -> NIOHTTP2StreamHandle {
+        let headers: HPACKHeaders = [":method": "POST", ":path": "/", ":scheme": "https", ":authority": "localhost"]
+        let handle = try connection.openStream(headers: headers, endStream: false) { _ in state }
+        _ = connection.withStream(handle) { stream, state in Self.write(&stream, state) }
+        return handle
+    }
+}
+
+/// Closes its channel from `makeStreamState`, as an error handler would on a failed write.
+struct ClosingServerConsumer: NIOHTTP2ServerStreamConsumer {
+    struct StreamState {}
+    let channel: EmbeddedChannel
+    let log: ConsumerLog
+
+    mutating func makeStreamState(for stream: inout NIOHTTP2Stream) -> StreamState {
+        self.channel.close(promise: nil)
+        return StreamState()
+    }
+
+    mutating func processStreams(_ streams: inout NIOHTTP2Streams<ClosingServerConsumer>) {
+        streams.forEachReady { stream, _ in
+            if stream.events.contains(.closed) {
+                self.log.closeReasons.append(stream.closeReason)
+            }
+        }
+    }
+}
+
+/// What a client writes first, then `frames`, encoded by hand (no client handler to keep them valid).
+func rawClientBytes(_ frames: [HTTP2Frame]) throws -> ByteBuffer {
+    var buffer = ByteBuffer(string: "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+    var encoder = HTTP2FrameEncoder(allocator: ByteBufferAllocator())
+    for frame in [HTTP2Frame(streamID: .rootStream, payload: .settings(.settings([])))] + frames {
+        if let extra = try encoder.encode(frame: frame, to: &buffer), case .byteBuffer(var bytes) = extra {
+            buffer.writeBuffer(&bytes)
+        }
+    }
+    return buffer
+}
+
+let rawRequestHeaders: HPACKHeaders = [":method": "POST", ":path": "/", ":scheme": "https", ":authority": "localhost"]
 
 @Suite("HTTP/2 stream consumer")
 struct StreamConsumerTests {
@@ -481,6 +572,96 @@ struct StreamConsumerTests {
             return nil
         }
         #expect(lastStreamIDs == [3])
+    }
+
+    @Test("A writer revived by .writable after every flush keeps going past the visit rounds of one pass")
+    func writerOutlastsTheVisitRounds() throws {
+        let (channel, connection) = try ChunkWriterConsumer.connect(high: 1024, low: 512)
+        // About 20 rounds of two chunks each, well past one pass's rounds; within the default 64 KiB window.
+        let state = ChunkWriterConsumer.StreamState(left: 40_000, chunk: 1000)
+        _ = try ChunkWriterConsumer.open(connection, state)
+        channel.embeddedEventLoop.run()
+        #expect(state.left == 0)
+    }
+
+    @Test("Pending bytes exactly at the high watermark still bring .writable back")
+    func exactlyAtTheHighWatermark() throws {
+        let (channel, connection) = try ChunkWriterConsumer.connect(high: 1024, low: 512)
+        let state = ChunkWriterConsumer.StreamState(left: 4096, chunk: 1024)
+        _ = try ChunkWriterConsumer.open(connection, state)
+        channel.embeddedEventLoop.run()
+        #expect(state.left == 0)
+    }
+
+    @Test("A channel closed from makeStreamState gives the stream its .closed visit, after its state exists")
+    func closeInsideMakeStreamState() async {
+        await #expect(processExitsWith: .success) {
+            let channel = EmbeddedChannel()
+            let log = ConsumerLog()
+            _ = try channel.pipeline.syncOperations.configureHTTP2Connection { _ in
+                ClosingServerConsumer(channel: channel, log: log)
+            }
+            try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
+            let headers = HTTP2Frame(streamID: 1, payload: .headers(.init(headers: rawRequestHeaders, endStream: true)))
+            _ = try? channel.writeInbound(try rawClientBytes([headers]))
+            channel.embeddedEventLoop.run()
+            precondition(log.closeReasons.count == 1, "expected one .closed visit, saw \(log.closeReasons.count)")
+        }
+    }
+
+    @Test("A stream nio-http2 resets itself, on a bad inbound frame, isn't reported as reset by the peer")
+    func handlerResetIsLocal() throws {
+        let server = EmbeddedChannel()
+        let log = ConsumerLog()
+        _ = try server.pipeline.syncOperations.configureHTTP2Connection { _ in EchoServerConsumer(log: log) }
+        try server.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
+        var headers = rawRequestHeaders
+        headers.add(name: "content-length", value: "1")
+        // Five bytes against a content-length of one: nio-http2 resets the stream with PROTOCOL_ERROR.
+        let frames = [
+            HTTP2Frame(streamID: 1, payload: .headers(.init(headers: headers))),
+            HTTP2Frame(
+                streamID: 1,
+                payload: .data(.init(data: .byteBuffer(ByteBuffer(repeating: 0x41, count: 5)), endStream: true))
+            ),
+        ]
+        _ = try? server.writeInbound(try rawClientBytes(frames))
+
+        guard case .some(.some(.reset(let code, let byPeer))) = log.closeReasons.first else {
+            Issue.record("closed with \(log.closeReasons)")
+            return
+        }
+        #expect(code == .protocolError)
+        #expect(!byPeer)
+    }
+
+    @Test("On a server, the client cancelling a stream after its GOAWAY is a reset, not a refusal")
+    func peerCancelAfterItsGoAwayIsAReset() throws {
+        let pair = try ConsumerPair()
+        let handle = try pair.open(ObservedStream(), endStream: false)
+        try pair.interact()
+        pair.connection.sendGoAway(errorCode: .noError)
+        try pair.interact()
+        _ = pair.connection.withStream(handle) { stream, _ in stream.reset(.cancel) }
+        try pair.interact()
+
+        guard case .some(.some(.reset(.cancel, byPeer: true))) = pair.serverLog.closeReasons.first else {
+            Issue.record("closed with \(pair.serverLog.closeReasons)")
+            return
+        }
+    }
+
+    @Test("completeWhenWritten after the end was sent succeeds at once")
+    func completeWhenWrittenAfterTheEnd() throws {
+        let pair = try ConsumerPair()
+        let handle = try pair.open(ObservedStream(), endStream: false)
+        _ = pair.connection.withStream(handle) { stream, _ in try? stream.writeEnd() }
+        let promise = pair.client.eventLoop.makePromise(of: Void.self)
+        var succeeded = false
+        promise.futureResult.whenSuccess { succeeded = true }
+        _ = pair.connection.withStream(handle) { stream, _ in stream.completeWhenWritten(promise) }
+        #expect(succeeded)
+        try pair.interact()
     }
 
     @Test("Stale handles resolve to nothing")

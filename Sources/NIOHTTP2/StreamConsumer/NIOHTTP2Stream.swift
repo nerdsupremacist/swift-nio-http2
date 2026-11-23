@@ -101,8 +101,9 @@ public struct NIOHTTP2Stream: ~Copyable {
         self.core.records[self.slot].localEndWritten
     }
 
-    /// Opt-in socket-level completion: succeeds once the stream's latest write (or its end) is written, fails if it's
-    /// dropped. No promise exists unless one is asked for.
+    /// Opt-in socket-level completion: succeeds once the stream's held write is written (or, with none held, its next
+    /// write), and at once if the end was already sent. Fails if that write is dropped. No promise exists unless one is
+    /// asked for.
     public mutating func completeWhenWritten(_ promise: EventLoopPromise<Void>) {
         self.core.completeWhenWritten(self.slot, promise)
     }

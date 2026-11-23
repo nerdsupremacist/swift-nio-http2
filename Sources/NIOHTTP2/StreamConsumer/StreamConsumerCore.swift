@@ -40,6 +40,7 @@ internal final class StreamConsumerCore {
         var isListedForHeldWrite = false
         var localEndWritten = false
         var localEndEncoded = false
+        var localEndFlushed = false
         var localReset = false
         var pendingBytes = 0
         var isAboveHighWatermark = false
@@ -67,6 +68,7 @@ internal final class StreamConsumerCore {
             self.isListedForHeldWrite = false
             self.localEndWritten = false
             self.localEndEncoded = false
+            self.localEndFlushed = false
             self.localReset = false
             self.pendingBytes = 0
             self.isAboveHighWatermark = false
@@ -115,7 +117,9 @@ internal final class StreamConsumerCore {
     internal var needsFlush = false
     internal var isReading = false
     internal var isVisiting = false
-    internal var isFlushing = false
+    /// Flushes of ours in progress. A batch inside one (a promise call-out) leaves its flush to the outer flush.
+    internal var flushDepth = 0
+    internal var isVisitScheduled = false
     internal var parentIsWritable = true
 
     internal var isActive = false
@@ -278,20 +282,32 @@ internal final class StreamConsumerCore {
     }
 
     internal func flushIfNeeded() {
-        guard self.needsFlush, !self.isReading, let handler = self.handler, let context = self.context else { return }
-        self.needsFlush = false
-        self.isFlushing = true
-        handler.flush(context: context)
-        self.isFlushing = false
+        guard self.flushDepth == 0, !self.isReading, let handler = self.handler, let context = self.context else { return }
+        // Writes made by call-outs during the flush leave in the next round.
+        while self.needsFlush {
+            self.needsFlush = false
+            self.flushDepth += 1
+            handler.flush(context: context)
+            self.flushDepth -= 1
+        }
     }
+
+    /// One pass visits at most this many rounds: a stream that keeps getting events (a writer revived by `.writable`
+    /// after every flush) continues in a pass of its own, so other channels on the loop get their turn.
+    internal static var visitRoundsPerPass: Int { 8 }
 
     /// Visits the consumer while streams or the connection have events, outside reads and batches.
     internal func visitIfNeeded() {
-        guard self.batchDepth == 0, !self.isReading, !self.isVisiting, !self.isFlushing else { return }
+        guard self.batchDepth == 0, !self.isReading, !self.isVisiting, self.flushDepth == 0 else { return }
         // Untaken parts don't re-queue a stream, so a visit only repeats for events that arrived during the last one
-        // (for example `.localEndSent` after its flush). The bound guards against a consumer that skips its ready list.
+        // (for example `.writable` after its flush). A visit that adds no events ends the pass, so a consumer that skips
+        // its ready list doesn't spin.
         var rounds = 0
-        while !self.ready.isEmpty || !self.connectionEvents.isEmpty, let host = self.host, rounds < 8 {
+        while !self.ready.isEmpty || !self.connectionEvents.isEmpty, let host = self.host {
+            guard rounds < Self.visitRoundsPerPass else {
+                self.scheduleVisit()
+                return
+            }
             let version = self.readyVersion
             rounds += 1
             self.visitCount += 1
@@ -306,6 +322,16 @@ internal final class StreamConsumerCore {
             if self.readyVersion == version && self.connectionEvents.isEmpty {
                 break
             }
+        }
+    }
+
+    private func scheduleVisit() {
+        guard !self.isVisitScheduled, let eventLoop = self.context?.eventLoop else { return }
+        self.isVisitScheduled = true
+        let core = NIOLoopBound(self, eventLoop: eventLoop)
+        eventLoop.execute {
+            core.value.isVisitScheduled = false
+            core.value.visitIfNeeded()
         }
     }
 
@@ -386,14 +412,10 @@ internal final class StreamConsumerCore {
         guard self.records[slot].closeReason == nil else { return }
         self.records[slot].closeReason = reason
         self.records[slot].window.closed = true
-        if let held = self.records[slot].held {
-            self.records[slot].held = nil
-            held.promise?.fail(NIOHTTP2StreamError.writeOutOfOrder)
-        }
-        if let completion = self.records[slot].completion {
-            self.records[slot].completion = nil
-            completion.fail(NIOHTTP2StreamError.connectionClosed(underlying: nil))
-        }
+        let heldPromise = self.records[slot].held?.promise
+        self.records[slot].held = nil
+        let completion = self.records[slot].completion
+        self.records[slot].completion = nil
         let id = self.records[slot].id
         if self.slotByID[id] == slot {
             self.slotByID.removeValue(forKey: id)
@@ -403,6 +425,9 @@ internal final class StreamConsumerCore {
             self.checkOpenable()
         }
         self.markReady(slot, .closed)
+        // Call-outs last: a callback that opens a stream sees the freed capacity.
+        heldPromise?.fail(NIOHTTP2StreamError.writeOutOfOrder)
+        completion?.fail(NIOHTTP2StreamError.connectionClosed(underlying: nil))
     }
 }
 
@@ -454,6 +479,10 @@ extension StreamConsumerCore: HTTP2InboundStreamMultiplexer {
         }
         self.records[slot].inbound.append(part)
         self.markReady(slot, .readable)
+        if !self.isReading {
+            // The channel closed during this frame (in `makeStreamState`): no read completes, so visit now.
+            self.visitIfNeeded()
+        }
     }
 
     private func openPeerStream(_ id: HTTP2StreamID) -> Int? {
@@ -461,7 +490,11 @@ extension StreamConsumerCore: HTTP2InboundStreamMultiplexer {
         let slot = self.allocateSlot(id: id, isLocal: false)
         self.highestPeerStreamID = max(self.highestPeerStreamID, id)
         self.records[slot].events = [.opened]
+        // Not a batch's end (writes made here wait for the read to complete), but no visit may run while the consumer is
+        // making the state. If the channel closes in there, `receivedFrame` runs the final visit.
+        self.batchDepth += 1
         host.makePeerStreamState(slot)
+        self.batchDepth -= 1
         return slot
     }
 
@@ -476,6 +509,13 @@ extension StreamConsumerCore: HTTP2InboundStreamMultiplexer {
             self.needsGoAwaySweep = true
         default:
             break
+        }
+    }
+
+    /// nio-http2 is about to reset a stream over a bad inbound frame: the reset is ours, not the peer's.
+    internal func handlerResetsStream(_ streamID: HTTP2StreamID) {
+        if let slot = self.slotByID[streamID] {
+            self.records[slot].localReset = true
         }
     }
 
@@ -499,7 +539,7 @@ extension StreamConsumerCore: HTTP2InboundStreamMultiplexer {
             let reason: NIOHTTP2StreamCloseReason
             if let code = event.reason {
                 if let lastStreamID = self.goAwayLastStreamID, event.streamID > lastStreamID, code == .cancel,
-                    !self.records[slot].localReset
+                    self.records[slot].isLocal, !self.records[slot].localReset
                 {
                     reason = .refused(lastStreamID: lastStreamID)
                 } else {

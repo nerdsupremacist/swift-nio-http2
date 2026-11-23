@@ -25,7 +25,7 @@ internal final class StreamConsumerHost<Consumer: NIOHTTP2StreamConsumer & ~Copy
     internal let box: StreamConnectionBox<Consumer>
     internal var consumer: Consumer
     @usableFromInline
-    internal var states = StreamStatePages<Consumer.StreamState>()
+    internal let states = StreamStatePages<Consumer.StreamState>()
     private let makeState: ((inout Consumer, inout NIOHTTP2Stream) -> Consumer.StreamState)?
 
     internal init(

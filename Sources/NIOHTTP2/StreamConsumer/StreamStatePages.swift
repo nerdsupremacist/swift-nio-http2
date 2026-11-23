@@ -17,8 +17,11 @@
 /// A value's address is stable until the storage is destroyed, so a value can be lent `inout` while other slots are
 /// added (a consumer may open a stream while it's visiting another). Like swift-nio-quic's `PagedBuffer`, this is not
 /// safe by itself: callers must not keep a pointer beyond the access it was made for.
+///
+/// A class rather than a `~Copyable` struct: a stored noncopyable struct gives its holder a fragile setter that calls
+/// the struct's resilient `deinit`, and Swift 6.2's inliner asserts on that in `@inlinable` code.
 @usableFromInline
-internal struct StreamStatePages<Element>: ~Copyable {
+internal final class StreamStatePages<Element> {
     @usableFromInline
     internal static var pageSize: Int { 32 }
 
@@ -33,7 +36,7 @@ internal struct StreamStatePages<Element>: ~Copyable {
 
     /// The slot's storage, allocating its page first if needed. Valid until the storage is destroyed.
     @inlinable
-    internal mutating func pointer(at index: Int) -> UnsafeMutablePointer<Element?> {
+    internal func pointer(at index: Int) -> UnsafeMutablePointer<Element?> {
         precondition(index >= 0)
         let page = index / Self.pageSize
         while self.pages.count <= page {
@@ -51,3 +54,6 @@ internal struct StreamStatePages<Element>: ~Copyable {
         }
     }
 }
+
+@available(*, unavailable)
+extension StreamStatePages: Sendable {}

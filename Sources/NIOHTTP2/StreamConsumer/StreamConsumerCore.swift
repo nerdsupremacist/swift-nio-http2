@@ -355,16 +355,17 @@ internal final class StreamConsumerCore {
 
     internal func readComplete() {
         self.isReading = false
-        if !self.heldWriteSlots.isEmpty {
-            // Writes made during the read (for example in `makeStreamState`) leave now.
-            self.withBatch {}
-        }
         if self.needsGoAwaySweep {
             self.needsGoAwaySweep = false
-            self.withBatch { self.sweepAboveGoAway() }
-        } else {
-            self.visitIfNeeded()
+            self.batchDepth += 1
+            self.sweepAboveGoAway()
+            self.batchDepth -= 1
         }
+        // One flush for the read batch: the visit's. Writes made during the read (in `makeStreamState`) stay held into
+        // the visit, so its END can fold into them. Without a visit, they and the sweep's RSTs leave here.
+        self.visitIfNeeded()
+        self.releaseHeldWrites()
+        self.flushIfNeeded()
     }
 
     internal func writabilityChanged(isWritable: Bool) {

@@ -614,6 +614,15 @@ public final class NIOHTTP2Handler: ChannelDuplexHandler {
     }
 
     public func channelReadComplete(context: ChannelHandlerContext) {
+        if case .consumer(let core) = self.inboundStreamMultiplexer {
+            // The consumer's visit comes first: its flush carries the read's automatic frames too, so a read batch
+            // leaves in one flush. Without consumer writes, the automatic frames leave here.
+            core.readComplete()
+            self.outboundBuffer.flushReceived()
+            self.unbufferAndFlushAutomaticFrames(context: context)
+            context.fireChannelReadComplete()
+            return
+        }
         self.outboundBuffer.flushReceived()
         self.unbufferAndFlushAutomaticFrames(context: context)
 

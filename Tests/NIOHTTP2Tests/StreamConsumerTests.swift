@@ -297,6 +297,34 @@ func rawClientBytes(_ frames: [HTTP2Frame]) throws -> ByteBuffer {
 
 let rawRequestHeaders: HPACKHeaders = [":method": "POST", ":path": "/", ":scheme": "https", ":authority": "localhost"]
 
+/// Writes the response head from `makeStreamState`, during the read, and ends the stream in its first visit.
+struct EarlyHeadServerConsumer: NIOHTTP2ServerStreamConsumer {
+    struct StreamState {}
+
+    mutating func makeStreamState(for stream: inout NIOHTTP2Stream) -> StreamState {
+        try? stream.writeHeaders([":status": "200"])
+        return StreamState()
+    }
+
+    mutating func processStreams(_ streams: inout NIOHTTP2Streams<EarlyHeadServerConsumer>) {
+        streams.forEachReady { stream, _ in
+            while stream.nextInboundPart() != nil {}
+            if stream.isInboundComplete, !stream.isOutboundComplete { try? stream.writeEnd() }
+        }
+    }
+}
+
+/// Counts the flushes that reach the socket.
+final class ConsumerFlushCounter: ChannelOutboundHandler {
+    typealias OutboundIn = Any
+    var flushes = 0
+
+    func flush(context: ChannelHandlerContext) {
+        self.flushes += 1
+        context.flush()
+    }
+}
+
 @Suite("HTTP/2 stream consumer")
 struct StreamConsumerTests {
     @Test("A request without a body gets its response")
@@ -662,6 +690,60 @@ struct StreamConsumerTests {
         _ = pair.connection.withStream(handle) { stream, _ in stream.completeWhenWritten(promise) }
         #expect(succeeded)
         try pair.interact()
+    }
+
+    @Test("A read batch that needs automatic frames and a response leaves in one flush")
+    func oneFlushPerReadBatch() throws {
+        let server = EmbeddedChannel()
+        let counter = ConsumerFlushCounter()
+        try server.pipeline.syncOperations.addHandler(counter)
+        _ = try server.pipeline.syncOperations.configureHTTP2Connection { _ in EchoServerConsumer(log: ConsumerLog()) }
+        try server.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
+        counter.flushes = 0
+
+        // The client's SETTINGS needs an ACK (an automatic frame), and the request gets its response in the visit.
+        let headers = HTTP2Frame(streamID: 1, payload: .headers(.init(headers: rawRequestHeaders, endStream: true)))
+        try server.writeInbound(try rawClientBytes([headers]))
+
+        #expect(counter.flushes == 1)
+        var written = ByteBuffer()
+        while let data = try server.readOutbound(as: IOData.self) {
+            if case .byteBuffer(var buffer) = data { written.writeBuffer(&buffer) }
+        }
+        #expect(written.readableBytes > 9 * 2, "SETTINGS ACK and the response")
+    }
+
+    @Test("Writes made during the read join the visit's flush, and the end folds into them")
+    func writesDuringTheReadJoinTheVisit() throws {
+        let server = EmbeddedChannel()
+        let counter = ConsumerFlushCounter()
+        try server.pipeline.syncOperations.addHandler(counter)
+        _ = try server.pipeline.syncOperations.configureHTTP2Connection { _ in EarlyHeadServerConsumer() }
+        try server.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 0)).wait()
+        _ = try server.readOutbound(as: IOData.self)  // the server's preface
+        counter.flushes = 0
+
+        let headers = HTTP2Frame(streamID: 1, payload: .headers(.init(headers: rawRequestHeaders, endStream: true)))
+        try server.writeInbound(try rawClientBytes([headers]))
+        #expect(counter.flushes == 1)
+
+        var decoder = HTTP2FrameDecoder(
+            allocator: ByteBufferAllocator(),
+            expectClientMagic: false,
+            maximumSequentialContinuationFrames: 5
+        )
+        while let data = try server.readOutbound(as: IOData.self) {
+            if case .byteBuffer(let buffer) = data { decoder.append(bytes: buffer) }
+        }
+        var streamFrames: [HTTP2Frame.FramePayload] = []
+        while let (frame, _) = try decoder.nextFrame() {
+            if frame.streamID == 1 { streamFrames.append(frame.payload) }
+        }
+        guard streamFrames.count == 1, case .headers(let response) = streamFrames[0] else {
+            Issue.record("stream frames: \(streamFrames)")
+            return
+        }
+        #expect(response.endStream)
     }
 
     @Test("Stale handles resolve to nothing")
